@@ -1,8 +1,8 @@
-# main.py (Version: 0.1.2 - Feb 10, 2025)
+# main.py (Version: 0.1.3 - Feb 11, 2025)
 # Updates:
-# - Scheduled times display only time of day (HH:MM AM/PM).
-# - Data fetched every 60 seconds.
-# - Improved filtering to avoid skipping valid arrivals.
+# - Exception handling for connection timeouts and other errors.
+# - Ensures periodic fetch continues to run after a failed fetch.
+# - Improved logging for better debugging and monitoring.
 
 from fastapi import FastAPI, HTTPException
 import httpx
@@ -21,21 +21,23 @@ async def fetch_data():
     current_hour = datetime.now().hour
 
     # Set time range dynamically: 300 minutes from 12 AM to 5 AM, 45 minutes otherwise
-    if 0 <= current_hour < 5:
-        minutes = 300  # Midnight to 5 AM
-    else:
-        minutes = 45  # 5 AM to Midnight
-
+    minutes = 300 if 0 <= current_hour < 5 else 45
     print(f"Fetching data with time range: {minutes} minutes")  # Log the time range for debugging
 
     url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs=4609,13948,13955,12957,13297,1416&minutes={minutes}&appid=OBFUSCATED_API"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-        if response.status_code == 200:
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
             cached_data = response.json()
-            print("Data fetched successfully.")
-        else:
-            print(f"Failed to fetch data: {response.status_code}")
+            print(f"[{datetime.now()}] Data fetched successfully.")
+    except httpx.ConnectTimeout:
+        print(f"[{datetime.now()}] Connection timeout while fetching data. Retrying in next interval...")
+    except httpx.HTTPStatusError as e:
+        print(f"[{datetime.now()}] HTTP error {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        print(f"[{datetime.now()}] Unexpected error: {e}")
 
 def convert_to_pacific(unix_time: int) -> str:
     """Convert Unix time (milliseconds) to a readable Pacific time string (only time of day)."""
@@ -83,7 +85,10 @@ async def startup_event():
     asyncio.create_task(periodic_fetch())  # Schedule periodic updates
 
 async def periodic_fetch():
-    """Fetch data periodically every 60 seconds."""
+    """Fetch data periodically every 60 seconds with error handling."""
     while True:
-        await fetch_data()
+        try:
+            await fetch_data()
+        except Exception as e:
+            print(f"[{datetime.now()}] Error during periodic fetch: {e}")
         await asyncio.sleep(60)  # Wait for 60 seconds before fetching again
