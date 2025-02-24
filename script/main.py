@@ -1,49 +1,51 @@
-# main.py (Version: 0.1.3 - Feb 11, 2025)
+# main.py (Version: 0.1.4 - Feb 11, 2025)
 # Updates:
-# - Exception handling for connection timeouts and other errors.
-# - Ensures periodic fetch continues to run after a failed fetch.
-# - Improved logging for better debugging and monitoring.
+# - Health check endpoint to ensure data freshness.
+# - Ensures periodic fetch continues to run.
+# - Logs more detailed errors for troubleshooting.
 
 from fastapi import FastAPI, HTTPException
 import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import Optional
 
 app = FastAPI()
 
-# Cached data for TriMet arrivals
+# Cached data for TriMet arrivals and last successful fetch time
 cached_data = {}
+last_successful_fetch = None  # Timestamp of the last successful data fetch
+
 
 async def fetch_data():
-    """Fetch data from the TriMet API with a dynamic time range based on current time."""
-    global cached_data
+    """Fetch data from the TriMet API with a dynamic time range based on the current time."""
+    global cached_data, last_successful_fetch
     current_hour = datetime.now().hour
-
-    # Set time range dynamically: 300 minutes from 12 AM to 5 AM, 45 minutes otherwise
-    minutes = 300 if 0 <= current_hour < 5 else 45
-    print(f"Fetching data with time range: {minutes} minutes")  # Log the time range for debugging
+    minutes = 300 if 0 <= current_hour < 5 else 45  # 300 minutes from 12 AM to 5 AM, 45 minutes otherwise
+    print(f"Fetching data with time range: {minutes} minutes")
 
     url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs=4609,13948,13955,12957,13297,1416&minutes={minutes}&appid=OBFUSCATED_API"
-    
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
             response.raise_for_status()
             cached_data = response.json()
-            print(f"[{datetime.now()}] Data fetched successfully.")
+            last_successful_fetch = datetime.now(timezone.utc)
+            print(f"[{last_successful_fetch}] Data fetched successfully.")
     except httpx.ConnectTimeout:
-        print(f"[{datetime.now()}] Connection timeout while fetching data. Retrying in next interval...")
+        print(f"[{datetime.now()}] Connection timeout. Retrying in next interval...")
     except httpx.HTTPStatusError as e:
         print(f"[{datetime.now()}] HTTP error {e.response.status_code}: {e.response.text}")
     except Exception as e:
         print(f"[{datetime.now()}] Unexpected error: {e}")
+
 
 def convert_to_pacific(unix_time: int) -> str:
     """Convert Unix time (milliseconds) to a readable Pacific time string (only time of day)."""
     utc_time = datetime.fromtimestamp(unix_time / 1000, tz=timezone.utc)
     pacific_time = utc_time.astimezone(timezone(timedelta(hours=-8)))
     return pacific_time.strftime("%I:%M %p")
+
 
 def calculate_minutes_until(unix_time: Optional[int]) -> Optional[int]:
     """Calculate minutes until arrival. Return None if unix_time is None."""
@@ -52,6 +54,7 @@ def calculate_minutes_until(unix_time: Optional[int]) -> Optional[int]:
     arrival_time = datetime.fromtimestamp(unix_time / 1000, tz=timezone.utc)
     now = datetime.now(tz=timezone.utc)
     return max(int((arrival_time - now).total_seconds() // 60), 0)
+
 
 @app.get("/stop/{stop_id}/route/{route_id}")
 async def get_next_arrivals(stop_id: int, route_id: int, count: Optional[int] = 2):
@@ -78,17 +81,33 @@ async def get_next_arrivals(stop_id: int, route_id: int, count: Optional[int] = 
     
     return {"next_arrivals": next_arrivals}
 
+
+@app.get("/health")
+async def health():
+    """Health check endpoint to ensure the data is up-to-date."""
+    if not last_successful_fetch:
+        raise HTTPException(status_code=503, detail="No successful data fetch yet.")
+    
+    time_since_last_fetch = (datetime.now(timezone.utc) - last_successful_fetch).total_seconds()
+    if time_since_last_fetch > 120:  # Data is stale if older than 2 minutes
+        raise HTTPException(status_code=503, detail=f"Data is stale. Last fetched {int(time_since_last_fetch)} seconds ago.")
+    
+    return {"status": "healthy", "last_fetch": last_successful_fetch.isoformat()}
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initial data fetch on startup and schedule periodic updates every 60 seconds."""
-    await fetch_data()  # Initial fetch
-    asyncio.create_task(periodic_fetch())  # Schedule periodic updates
+    await fetch_data()
+    asyncio.create_task(periodic_fetch())
+
 
 async def periodic_fetch():
-    """Fetch data periodically every 60 seconds with error handling."""
+    """Fetch data periodically every 60 seconds."""
     while True:
         try:
             await fetch_data()
         except Exception as e:
             print(f"[{datetime.now()}] Error during periodic fetch: {e}")
-        await asyncio.sleep(60)  # Wait for 60 seconds before fetching again
+        await asyncio.sleep(60)
+
