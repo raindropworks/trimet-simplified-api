@@ -1,0 +1,31 @@
+# Develpment branch of docker-compose
+
+services:
+  trimet-api:
+    build: .
+    container_name: trimet-simplified-api
+    working_dir: /app
+    ports:
+      - "65000:8000"
+    volumes:
+      - .:/app  # Mount the host directory
+      - /etc/localtime:/etc/localtime:ro  # Use host's timezone
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - UMASK=002
+      - TZ=America/Los_Angeles
+# Required enviornment variables
+      - TRIMET_API_KEY= #Required API key from TriMet
+      - STOP_IDS= #Required, comma delimited (no whitespace) list of stops
+# Optional environment variables
+#      - FETCH_MINUTES=45 #Optional of how far out to query arrivals, default 45
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+

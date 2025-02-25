@@ -1,9 +1,8 @@
-# main.py (Version: 0.1.5 - Feb 11, 2025)
+# main.py (Version: 0.1.5a - Feb 25, 2025)
 # Updates:
-# - Health check endpoint to ensure data freshness.
-# - Ensures periodic fetch continues to run.
-# - Logs more detailed errors for troubleshooting.
+# integrating environment variables to remove sensitive information hardcoded in script
 
+import os
 from fastapi import FastAPI, HTTPException
 import httpx
 import asyncio
@@ -12,19 +11,27 @@ from typing import Optional
 
 app = FastAPI()
 
+# Load required environment variables
+TRIMET_API_KEY = os.getenv("TRIMET_API_KEY")
+STOP_IDS = os.getenv("STOP_IDS")
+
+if not TRIMET_API_KEY or not STOP_IDS:
+    raise ValueError("Missing required environment variables: TRIMET_API_KEY and/or STOP_IDS")
+
 # Cached data for TriMet arrivals and last successful fetch time
 cached_data = {}
 last_successful_fetch = None  # Timestamp of the last successful data fetch
 
+# Load optional configuration
+FETCH_MINUTES = int(os.getenv("FETCH_MINUTES", 45))
+
 
 async def fetch_data():
-    """Fetch data from the TriMet API with a dynamic time range based on the current time."""
+    """Fetch TriMet data and update cache."""
     global cached_data, last_successful_fetch
-    current_hour = datetime.now().hour
-    minutes = 300 if 0 <= current_hour < 5 else 45  # 300 minutes from 12 AM to 5 AM, 45 minutes otherwise
-    print(f"Fetching data with time range: {minutes} minutes")
+    print(f"Fetching data for the next {FETCH_MINUTES} minutes.")
 
-    url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs=4609,13948,13955,12957,13297,1416&minutes={minutes}&appid=OBFUSCATED_API"
+    url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs={STOP_IDS}&minutes={FETCH_MINUTES}&appid={TRIMET_API_KEY}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
