@@ -1,38 +1,30 @@
-# main.py (Version: 1.0.0 - Feb 12, 2025
+# main.py (Version: 0.1.5 - Feb 11, 2025)
 # Updates:
-# - Use environment variables for API key and stop IDs.
-# - More robust health check (self-restarts if stale, also health check self-recovers if stale data is resolved)
-# - Setting up for integration in public docker image.
+# - Health check endpoint to ensure data freshness.
+# - Ensures periodic fetch continues to run.
+# - Logs more detailed errors for troubleshooting.
 
-import os
 from fastapi import FastAPI, HTTPException
 import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 app = FastAPI()
 
-# Load required environment variables
-TRIMET_API_KEY = os.getenv("TRIMET_API_KEY")
-STOP_IDS = os.getenv("STOP_IDS")
-
-if not TRIMET_API_KEY or not STOP_IDS:
-    raise ValueError("Missing required environment variables: TRIMET_API_KEY and/or STOP_IDS")
-
-# Load optional configuration
-FETCH_MINUTES = int(os.getenv("FETCH_MINUTES", 45))
-
-# Cached data & last fetch time
+# Cached data for TriMet arrivals and last successful fetch time
 cached_data = {}
-last_successful_fetch = None
+last_successful_fetch = None  # Timestamp of the last successful data fetch
+
 
 async def fetch_data():
-    """Fetch TriMet data and update cache."""
+    """Fetch data from the TriMet API with a dynamic time range based on the current time."""
     global cached_data, last_successful_fetch
-    print(f"Fetching data for the next {FETCH_MINUTES} minutes.")
+    current_hour = datetime.now().hour
+    minutes = 300 if 0 <= current_hour < 5 else 45  # 300 minutes from 12 AM to 5 AM, 45 minutes otherwise
+    print(f"Fetching data with time range: {minutes} minutes")
 
-    url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs={STOP_IDS}&minutes={FETCH_MINUTES}&appid={TRIMET_API_KEY}"
-    
+    url = f"https://developer.trimet.org/ws/V2/arrivals?locIDs=4609,13948,13955,12957,13297,1416&minutes={minutes}&appid=OBFUSCATED_API"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
@@ -40,59 +32,82 @@ async def fetch_data():
             cached_data = response.json()
             last_successful_fetch = datetime.now(timezone.utc)
             print(f"[{last_successful_fetch}] Data fetched successfully.")
-    except (httpx.ConnectTimeout, httpx.HTTPStatusError) as e:
-        print(f"[{datetime.now()}] Fetch failed: {e}")
+    except httpx.ConnectTimeout:
+        print(f"[{datetime.now()}] Connection timeout. Retrying in next interval...")
+    except httpx.HTTPStatusError as e:
+        print(f"[{datetime.now()}] HTTP error {e.response.status_code}: {e.response.text}")
     except Exception as e:
         print(f"[{datetime.now()}] Unexpected error: {e}")
 
+
+def convert_to_pacific(unix_time: int) -> str:
+    """Convert Unix time (milliseconds) to a readable Pacific time string (only time of day)."""
+    utc_time = datetime.fromtimestamp(unix_time / 1000, tz=timezone.utc)
+    pacific_time = utc_time.astimezone(timezone(timedelta(hours=-8)))
+    return pacific_time.strftime("%I:%M %p")
+
+
+def calculate_minutes_until(unix_time: Optional[int]) -> Optional[int]:
+    """Calculate minutes until arrival. Return None if unix_time is None."""
+    if unix_time is None:
+        return None
+    arrival_time = datetime.fromtimestamp(unix_time / 1000, tz=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
+    return max(int((arrival_time - now).total_seconds() // 60), 0)
+
+
 @app.get("/stop/{stop_id}/route/{route_id}")
-async def get_next_arrivals(stop_id: int, route_id: int, count: int = 2):
+async def get_next_arrivals(stop_id: int, route_id: int, count: Optional[int] = 2):
     """Return the next arrivals for a specific stop and route."""
     if not cached_data:
         raise HTTPException(status_code=503, detail="No data available. Please try again later.")
-
+    
     arrivals = cached_data.get("resultSet", {}).get("arrival", [])
     next_arrivals = [
         {
-            "minutes_until_arrival": max((datetime.fromtimestamp(arrival.get("estimated") or arrival.get("scheduled"), tz=timezone.utc) - datetime.now(timezone.utc)).total_seconds() // 60, 0),
-            "scheduled_time": datetime.fromtimestamp(arrival.get("scheduled"), tz=timezone.utc).strftime("%I:%M %p")
+            "minutes_until_arrival": calculate_minutes_until(arrival.get("estimated") or arrival.get("scheduled")),
+            "scheduled_time": convert_to_pacific(arrival.get("scheduled")),
         }
         for arrival in arrivals
         if arrival.get("locid") == stop_id and arrival.get("signRoute") == route_id
-    ][:count]
+        and calculate_minutes_until(arrival.get("estimated") or arrival.get("scheduled")) is not None
+    ]
+
+    if len(next_arrivals) > count:
+        next_arrivals = next_arrivals[:count]  # Limit to `count` arrivals
 
     if not next_arrivals:
-        raise HTTPException(status_code=404, detail="No upcoming arrivals found.")
-
+        raise HTTPException(status_code=404, detail="No upcoming arrivals found for this stop and route.")
+    
     return {"next_arrivals": next_arrivals}
+
 
 @app.get("/health")
 async def health():
-    """Health check that returns stale status and allows self-recovery."""
-    global last_successful_fetch
+    """Health check endpoint to ensure the data is up-to-date."""
     if not last_successful_fetch:
         raise HTTPException(status_code=503, detail="No successful data fetch yet.")
-
+    
     time_since_last_fetch = (datetime.now(timezone.utc) - last_successful_fetch).total_seconds()
-    if time_since_last_fetch > 120:
-        print(f"Health check failed: Data is stale for {int(time_since_last_fetch)} seconds. Attempting fetch.")
-        await fetch_data()  # Try fetching immediately before failing health check
-        time_since_last_fetch = (datetime.now(timezone.utc) - last_successful_fetch).total_seconds()
-
-    if time_since_last_fetch > 120:
+    if time_since_last_fetch > 120:  # Data is stale if older than 2 minutes
         raise HTTPException(status_code=503, detail=f"Data is stale. Last fetched {int(time_since_last_fetch)} seconds ago.")
-
+    
     return {"status": "healthy", "last_fetch": last_successful_fetch.isoformat()}
+
 
 @app.on_event("startup")
 async def startup_event():
-    """Initial fetch and periodic updates."""
+    """Initial data fetch on startup and schedule periodic updates every 60 seconds."""
     await fetch_data()
     asyncio.create_task(periodic_fetch())
 
+
 async def periodic_fetch():
-    """Continuously fetch data every 60 seconds."""
+    """Fetch data periodically every 60 seconds."""
     while True:
-        await fetch_data()
+        try:
+            await fetch_data()
+        except Exception as e:
+            print(f"[{datetime.now()}] Error during periodic fetch: {e}")
         await asyncio.sleep(60)
 
