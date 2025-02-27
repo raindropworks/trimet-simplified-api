@@ -1,6 +1,9 @@
-# main.py (Version: 0.1.5a - Feb 25, 2025)
+# main.py (Version: 1.0.0 - Feb 25, 2025)
 # Updates:
-# integrating environment variables to remove sensitive information hardcoded in script
+# (Rolling updates since 0.1.5a)
+# Version endpoint and announce on server start
+# More robust health status, including self-heal
+# First production version
 
 import os
 from fastapi import FastAPI, HTTPException
@@ -10,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 app = FastAPI()
+
+API_VERSION = "1.0.0-prod"
 
 # Load required environment variables
 TRIMET_API_KEY = os.getenv("TRIMET_API_KEY")
@@ -91,20 +96,36 @@ async def get_next_arrivals(stop_id: int, route_id: int, count: Optional[int] = 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint to ensure the data is up-to-date."""
+    """Health check that returns stale status and allows self-recovery."""
+    global last_successful_fetch
     if not last_successful_fetch:
         raise HTTPException(status_code=503, detail="No successful data fetch yet.")
-    
+
     time_since_last_fetch = (datetime.now(timezone.utc) - last_successful_fetch).total_seconds()
-    if time_since_last_fetch > 120:  # Data is stale if older than 2 minutes
+    if time_since_last_fetch > 120:
+        await fetch_data()  # Try fetching immediately before failing health check
+        time_since_last_fetch = (datetime.now(timezone.utc) - last_successful_fetch).total_seconds()
+
+    if time_since_last_fetch > 120:
         raise HTTPException(status_code=503, detail=f"Data is stale. Last fetched {int(time_since_last_fetch)} seconds ago.")
-    
+
     return {"status": "healthy", "last_fetch": last_successful_fetch.isoformat()}
 
+@app.get("/version")
+async def version():
+    """Returns the current API version."""
+    return {"version": API_VERSION}
 
 @app.on_event("startup")
 async def startup_event():
-    """Initial data fetch on startup and schedule periodic updates every 60 seconds."""
+    """Initial fetch and periodic updates."""
+    print("\n=========================================================")
+    print("TriMet Simplified API")
+    print("By Raindrop Works")
+    print(f"Version {API_VERSION}")
+    print(f"https://github.com/raindropworks/trimet-simplified-api\n")
+    print("=========================================================")
+    
     await fetch_data()
     asyncio.create_task(periodic_fetch())
 
